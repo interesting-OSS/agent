@@ -1,0 +1,51 @@
+id: urban
+name: 都市
+category: 都市系
+
+narrator_persona: "擅长都市题材的网络作家，以接地气的细节和真实的都市氛围见长"
+
+writing_blueprint:
+  wording: "口语化、生活化，接地气但不低俗"
+  atmosphere: "现实、压抑与释放交替"
+  perspective: "third_person_limited"
+  elements: ["现代都市", "职场", "人际关系", "社会阶层"]
+
+forbidden_terms:
+  from_genres: ["xianxia", "western-fantasy", "scifi-apocalypse"]
+  terms:
+    - "灵气"
+    - "丹田"
+    - "渡劫"
+    - "飞升"
+    - "魔力"
+    - "魔核"
+    - "基因进化"
+
+satisfaction_beats:
+  - "职场逆袭的打脸爽感"
+  - "都市生活的共鸣与代入"
+  - "人际关系的复杂博弈"
+  - "阶层跃升的成就感"
+
+taboos:
+  - "禁止悬浮感——角色的收入、消费、社交圈应符合其设定"
+  - "禁止文艺腔——不写'城市的霓虹像眼泪'"
+  - "禁止精英腔——不是所有主角都是总裁/神豪"
+  - "禁止修仙/奇幻词汇混入"
+
+pacing_rules:
+  tension_cycle: "每5-8章一个小高潮"
+  buildup_limit: 4
+
+prompt_segment: |
+  ## 文风要求
+  - 写堵车、排队、等电梯——用日常细节建立代入感
+  - 通过手机表达情绪——而不是心理独白
+  - 对话要碎片化——真实的人说话不完整
+  - 收入消费要具体——让读者相信这个人是真实存在的
+
+  ## 禁止事项
+  - 绝不使用修仙词汇——灵气/丹田/元婴/渡劫
+  - 绝不使用奇幻词汇——魔力/魔核/元素
+  - 不写悬浮感——收入和消费必须匹配
+  - 不写文艺腔——接地气是都市文的核心

@@ -5,19 +5,18 @@ from app.database import engine, AsyncSessionLocal
 from app.models.base import Base
 from app.models.user import User
 from app.middleware.auth_middleware import DEFAULT_USER_ID
-from app.security import hash_password
 from sqlalchemy import select
 
 
 async def ensure_default_user():
-    """确保默认用户存在，跳过登录用。"""
+    """确保默认用户存在（单用户模式）。"""
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(User).where(User.id == DEFAULT_USER_ID))
         if not result.scalar():
             db.add(User(
                 id=DEFAULT_USER_ID,
                 email="dev@localhost",
-                password_hash=hash_password("dev"),
+                password_hash="",
                 display_name="开发者",
             ))
             await db.commit()
@@ -46,10 +45,8 @@ async def health():
     return {"status": "ok"}
 
 
-# == Step 4: Auth + Novels ==
-from app.api.v1.auth import router as auth_router
+# == Novels ==
 from app.api.v1.novels import router as novels_router
-app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(novels_router, prefix="/api/v1/novels", tags=["novels"])
 
 # == Step 6: Characters + Careers + World + Orgs + Relationships ==

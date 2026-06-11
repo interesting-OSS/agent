@@ -15,15 +15,3 @@ def scan_forbidden_terms(text: str, forbidden_terms: list[str]) -> list[dict]:
                 "severity": "fatal",
             })
     return violations
-
-
-def mark_issues(violations: list[dict]) -> str:
-    """生成人类可读的违规报告"""
-    if not violations:
-        return "类型合规检查通过——未发现禁止术语。"
-    lines = ["# 类型合规检查报告\n", f"发现 {len(violations)} 个违规项：\n"]
-    for i, v in enumerate(violations, 1):
-        lines.append(f"{i}. **{v['term']}** (严重度: {v['severity']})")
-        lines.append(f"   位置: 第 {v['position']} 字符附近")
-        lines.append(f"   上下文: {v['context']}\n")
-    return "\n".join(lines)

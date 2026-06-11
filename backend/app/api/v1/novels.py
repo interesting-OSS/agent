@@ -1,27 +1,24 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.middleware.auth_middleware import get_current_user_id
 from app.models.novel import Novel
 from app.schemas.novel import NovelCreate, NovelUpdate, NovelResponse
 
 router = APIRouter()
 
 
-async def _get_user_id(request: Request) -> str:
-    return await get_current_user_id(request)
+async def _verify_novel_exists(novel_id: str, db: AsyncSession):
+    r = await db.execute(select(Novel).where(Novel.id == novel_id))
+    if not r.scalar():
+        raise HTTPException(404, "Novel not found")
 
 
 @router.get("", response_model=list[NovelResponse])
-async def list_novels(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-):
-    user_id = await _get_user_id(request)
+async def list_novels(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(Novel).where(Novel.user_id == user_id).order_by(Novel.updated_at.desc())
+        select(Novel).order_by(Novel.updated_at.desc())
     )
     return result.scalars().all()
 
@@ -29,15 +26,14 @@ async def list_novels(
 @router.post("", response_model=NovelResponse, status_code=201)
 async def create_novel(
     data: NovelCreate,
-    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    user_id = await _get_user_id(request)
+    from app.middleware.auth_middleware import DEFAULT_USER_ID
     novel = Novel(
-        user_id=user_id,
+        user_id=DEFAULT_USER_ID,
         title=data.title,
         genre_id=data.genre_id,
-        genre_config={},           # Step 5 填充
+        genre_config={},
         writing_style=data.writing_style,
         target_word_count=data.target_word_count,
     )
@@ -50,30 +46,21 @@ async def create_novel(
 @router.get("/{novel_id}", response_model=NovelResponse)
 async def get_novel(
     novel_id: str,
-    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    user_id = await _get_user_id(request)
-    result = await db.execute(
-        select(Novel).where(Novel.id == novel_id, Novel.user_id == user_id)
-    )
-    novel = result.scalar()
-    if not novel:
-        raise HTTPException(status_code=404, detail="Novel not found")
-    return novel
+    await _verify_novel_exists(novel_id, db)
+    result = await db.execute(select(Novel).where(Novel.id == novel_id))
+    return result.scalar()
 
 
 @router.patch("/{novel_id}", response_model=NovelResponse)
 async def update_novel(
     novel_id: str,
     data: NovelUpdate,
-    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    user_id = await _get_user_id(request)
-    result = await db.execute(
-        select(Novel).where(Novel.id == novel_id, Novel.user_id == user_id)
-    )
+    await _verify_novel_exists(novel_id, db)
+    result = await db.execute(select(Novel).where(Novel.id == novel_id))
     novel = result.scalar()
     if not novel:
         raise HTTPException(status_code=404, detail="Novel not found")
@@ -89,13 +76,10 @@ async def update_novel(
 @router.delete("/{novel_id}", status_code=204)
 async def delete_novel(
     novel_id: str,
-    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    user_id = await _get_user_id(request)
-    result = await db.execute(
-        select(Novel).where(Novel.id == novel_id, Novel.user_id == user_id)
-    )
+    await _verify_novel_exists(novel_id, db)
+    result = await db.execute(select(Novel).where(Novel.id == novel_id))
     novel = result.scalar()
     if not novel:
         raise HTTPException(status_code=404, detail="Novel not found")

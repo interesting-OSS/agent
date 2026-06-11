@@ -83,7 +83,7 @@ export default function DashboardPage() {
             </span>
           </div>
         </div>
-        <button className="btn-ghost" onClick={() => router.push("/login")}>
+        <button className="btn-ghost" onClick={() => router.push("/dashboard")}>
           <LogoutOutlined /> 关于
         </button>
       </header>

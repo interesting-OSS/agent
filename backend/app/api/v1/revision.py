@@ -1,19 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
-from app.middleware.auth_middleware import get_current_user_id
 from app.models.novel import Novel
 from app.models.chapter import Chapter, ChapterVersion
 from app.services.chapter_regenerator import regenerate_chapter
 
 router = APIRouter()
 
-@router.post("/{novel_id}/chapters/{chapter_id}/revise")
-async def revise_chapter(novel_id: str, chapter_id: str, data: dict, request: Request, db: AsyncSession = Depends(get_db)):
-    uid = await get_current_user_id(request)
-    r = await db.execute(select(Novel).where(Novel.id == novel_id, Novel.user_id == uid))
+async def _verify_novel_exists(novel_id: str, db: AsyncSession):
+    r = await db.execute(select(Novel).where(Novel.id == novel_id))
     if not r.scalar(): raise HTTPException(404)
+
+@router.post("/{novel_id}/chapters/{chapter_id}/revise")
+async def revise_chapter(novel_id: str, chapter_id: str, data: dict, db: AsyncSession = Depends(get_db)):
+    await _verify_novel_exists(novel_id, db)
     ch = (await db.execute(select(Chapter).where(Chapter.id == chapter_id, Chapter.novel_id == novel_id))).scalar()
     if not ch: raise HTTPException(404)
 
@@ -36,10 +37,8 @@ async def revise_chapter(novel_id: str, chapter_id: str, data: dict, request: Re
     return {"content": ch.content, "word_count": ch.word_count}
 
 @router.get("/{novel_id}/chapters/{chapter_id}/versions")
-async def list_versions(novel_id: str, chapter_id: str, request: Request, db: AsyncSession = Depends(get_db)):
-    uid = await get_current_user_id(request)
-    r = await db.execute(select(Novel).where(Novel.id == novel_id, Novel.user_id == uid))
-    if not r.scalar(): raise HTTPException(404)
+async def list_versions(novel_id: str, chapter_id: str, db: AsyncSession = Depends(get_db)):
+    await _verify_novel_exists(novel_id, db)
     vers = (await db.execute(
         select(ChapterVersion).where(ChapterVersion.chapter_id == chapter_id).order_by(ChapterVersion.version_number.desc())
     )).scalars().all()

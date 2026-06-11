@@ -1,0 +1,824 @@
+================================================================================
+                     墨庐 AI 小说写作系统 — 后端完整流程说明
+================================================================================
+
+目录:
+  一、整体架构概览
+  二、启动流程
+  三、API 路由全景
+  四、核心生成流水线 — LangGraph
+  五、上下文组装 — ContextAssembler
+  六、LLM 适配层
+  七、数据模型全景
+  八、典型请求流程示意
+  九、第二步：搭建设定（详细）
+  十、Data Layer 详解
+  十一、按任务复杂度分配合适模型（降本设计）
+  十二、桥接 LangChain 生态（适配器详解）
+  十三、多 Agent 协作框架（State + 虚拟文件系统 + 并发预检）
+  十四、asyncio.gather 并发详解
+  十五、Inspector + Guardian 质量把关（10维打分 + 双重扫描）
+
+
+================================================================================
+一、整体架构概览
+================================================================================
+
+Frontend (Next.js)
+       │
+       ▼  HTTP/SSE
+┌──────────────────────────────────────────────┐
+│  FastAPI (main.py)                            │
+│  ├── CORS Middleware                          │
+│  ├── Auth Middleware (单用户模式)               │
+│  ├── 14 个 API Router                         │
+│  └── 启动/关闭 Lifecycle                       │
+├──────────────────────────────────────────────┤
+│  Service Layer                                │
+│  ├── ContextAssembler (上下文组装)              │
+│  ├── PlotAnalyzer (章节分析)                    │
+│  ├── ChapterRegenerator (章节重写)             │
+│  ├── ForeshadowService (伏笔管理)              │
+│  ├── ExportService (导出)                      │
+│  ├── BookImport (导入)                         │
+│  ├── AutoCharacter (自动角色生成)              │
+│  └── CareerService (职业体系生成)              │
+├──────────────────────────────────────────────┤
+│  LangGraph 流水线 (核心生成引擎)               │
+│  ├── StateGraph (章节生成 DAG)                 │
+│  ├── 6 个专用 AI Agent                         │
+│  └── 工具集 (扫描/一致性/文件系统)              │
+├──────────────────────────────────────────────┤
+│  LLM 适配层                                    │
+│  ├── BaseLLMProvider (抽象接口)                │
+│  ├── DeepSeekProvider / KimiProvider / Qwen   │
+│  └── LangChain Adapter (适配)                  │
+├──────────────────────────────────────────────┤
+│  Data Layer                                    │
+│  ├── SQLAlchemy Async (SQLite/PostgreSQL)      │
+│  ├── ChromaDB (向量检索)                       │
+│  └── 15 个数据模型                              │
+└──────────────────────────────────────────────┘
+
+
+================================================================================
+二、启动流程
+================================================================================
+
+1. Lifespan 事件：
+   - 启动时自动 create_all 建表 (SQLite)
+   - 创建默认用户 00000000-...（单用户模式，无需登录）
+   - 关闭时清理 LLM provider 连接
+
+2. 中间件：
+   - CORSMiddleware：允许所有来源跨域
+   - auth_middleware.py：极简——只定义了常量 DEFAULT_USER_ID，所有数据绑定到此用户
+
+3. 注册 14 组 API 路由
+
+
+================================================================================
+三、API 路由全景
+================================================================================
+
+3.1 小说 CRUD — novels.py
+    /api/v1/novels — 标准 REST：创建、列表、查看、更新、删除小说
+
+3.2 角色 — characters.py
+    /api/v1/novels/{novel_id}/characters — CRUD 角色
+    角色使用认知 6 层模型：
+    ┌───────┬─────────────────────┬──────────┐
+    │ 层级  │ 字段                │ 含义     │
+    ├───────┼─────────────────────┼──────────┤
+    │  L1   │ layer1_worldview    │ 世界观   │
+    │  L2   │ layer2_identity     │ 自我认同 │
+    │  L3   │ layer3_values       │ 价值观   │
+    │  L4   │ layer4_abilities    │ 能力     │
+    │  L5   │ layer5_skills       │ 技能     │
+    │  L6   │ layer6_environment  │ 环境     │
+    └───────┴─────────────────────┴──────────┘
+
+3.3 世界元素 — world.py
+    /api/v1/novels/{novel_id}/world — 地点、魔法体系、科技、文化、宗教、势力、道具
+
+3.4 组织/势力 — organizations.py
+    /api/v1/novels/{novel_id}/organizations — 宗门/家族/王国等组织及其成员关系
+
+3.5 角色关系 — relationships.py
+    /api/v1/novels/{novel_id}/relationships — 盟友/敌人/家人/师徒/恋人/对手
+
+3.6 职业体系 — careers.py
+    /api/v1/novels/{novel_id}/careers — 修炼/职业体系，支持 AI 自动生成
+
+3.7 类型系统 — main.py 内联路由
+    GET /api/v1/genre/list — 列出所有可用类型（仙侠、西幻等）
+    GET /api/v1/genre/{genre_id} — 获取类型配置详情
+    类型配置以 YAML 文件存储在 app/genre/configs/ 目录下
+
+3.8 章节生成（核心）— generation.py
+    POST /{novel_id}/chapters/{n}/generate — SSE 流式生成，实时推送进度
+    POST /{novel_id}/chapters/{n}/generate-simple — 非流式生成，返回完整结果
+
+3.9 伏笔管理 — foreshadows.py
+    /api/v1/novels/{novel_id}/foreshadows — CRUD + AI 自动检测伏笔
+
+3.10 章节分析 — analysis.py
+     GET /{novel_id}/analysis/{chapter_id} — 10 维质量分析
+
+3.11 章节修订 — revision.py
+     POST /{novel_id}/chapters/{chapter_id}/revise — 重写章节
+     三种模式: full(全章) / partial(局部) / structure(结构)
+     自动保存历史版本 (ChapterVersion)
+
+3.12 导出 — export.py
+     GET /{novel_id}/export?fmt=md — 导出 Markdown / TXT / HTML / PDF
+
+3.13 导入 — import_book.py
+     POST /api/v1/books/import — 上传文本文件，AI 自动解析
+
+3.14 其他内联路由
+     POST /{novel_id}/characters/auto — 自动生成角色
+     GET /{novel_id}/chapters — 列出所有章节
+     GET /{novel_id}/chapters/{chapter_id} — 获取单章
+
+
+================================================================================
+四、核心生成流水线 — LangGraph
+================================================================================
+
+4.1 State 定义 (state.py)
+
+ChapterState 继承 LangGraph 的 AgentState，包含：
+  - 输入参数: novel_id, chapter_number, genre_config, character_profiles, user_focus
+  - 上下文: 4 层上下文 (ContextAssembler 输出)
+  - 中间产物: Architect 报告, Guardian 预检, 章节正文
+  - 审查结果: Guardian 合规报告, Inspector 10 维质量报告
+  - 判定: pass / rewrite / regenerate
+
+4.2 流水线图 (generation_graph.py)
+
+assemble_context → preflight → write_chapter → review_chapter → decide_verdict
+                       │              ▲               │               │
+                       │              │               │          ┌────┴────┐
+                       │              └───────────────┘          │ pass    │ END
+                       │         (rewrite / regenerate)         │ rewrite │→ write
+                       └──────────────────────────────────────── │ regen   │→ write
+                                                                └─────────┘
+
+5 个节点:
+
+┌─────────────────────┬──────────────────────────────────────────────┐
+│ 节点                │ 功能                                         │
+├─────────────────────┼──────────────────────────────────────────────┤
+│ assemble_context    │ 验证上下文完整性，写入虚拟文件系统             │
+│ preflight           │ 并行运行 Architect + Guardian                 │
+│ write_chapter       │ Writer Agent 流式生成正文                     │
+│ review_chapter      │ 串行 Guardian → Inspector                    │
+│ decide_verdict      │ 判定: pass/rewrite/regenerate                 │
+└─────────────────────┴──────────────────────────────────────────────┘
+
+4.3 6 个 AI Agent (agents.py)
+
+每个 Agent 有独立的 system prompt、工具集和 LLM 后端：
+
+┌──────────────┬──────────────┬──────────────┬───────────────────────┐
+│ Agent        │ 角色         │ LLM 后端     │ 工具                  │
+├──────────────┼──────────────┼──────────────┼───────────────────────┤
+│ Writer       │ 正文写手     │ DeepSeek     │ think_tool            │
+│ Architect    │ 情节架构师   │ DeepSeek     │ think_tool            │
+│ Supervisor   │ 主编协调     │ DeepSeek     │ think_tool, 文件系统  │
+│ Inspector    │ 质量检查官   │ Kimi         │ think_tool, 扫描, 一致性│
+│ Guardian     │ 类型合规守卫 │ Qwen         │ think_tool, 术语扫描  │
+│ Custodian    │ 角色一致性   │ Qwen         │ think_tool, 一致性检查│
+└──────────────┴──────────────┴──────────────┴───────────────────────┘
+
+4.4 工具集 (tools.py)
+
+┌──────────────────────────────────┬──────────────────────────────────┐
+│ 工具                             │ 功能                             │
+├──────────────────────────────────┼──────────────────────────────────┤
+│ think_tool                       │ 记录 AI 反思过程                 │
+│ scan_forbidden_terms_tool        │ 机械扫描禁止术语,100%召回零幻觉  │
+│ check_consistency_tool           │ 检查角色行为与6层模型一致性      │
+│ ls_files / read_file / write_file│ 虚拟文件系统(Agent间上下文传递)  │
+└──────────────────────────────────┴──────────────────────────────────┘
+
+
+================================================================================
+五、上下文组装 — ContextAssembler
+================================================================================
+
+在 app/services/context_assembly.py，将上下文分为 4 层（总预算 ~46K tokens）：
+
+┌─────────────┬──────────────────────────────────────┬───────┐
+│ 层级        │ 内容                                 │ 预算  │
+├─────────────┼──────────────────────────────────────┼───────┤
+│ L1 Bible    │ 静态圣经: 类型铁律 + 角色总览        │ ~8K   │
+│ L2 Active   │ 活跃上下文: 上一章全文+角色状态      │ ~20K  │
+│ L3 History  │ 压缩历史: 最近10章摘要               │ ~15K  │
+│ L4 Plan     │ 本章大纲: 大纲节点 + 因果句          │ ~3K   │
+└─────────────┴──────────────────────────────────────┴───────┘
+
+支持 trim_to_budget(): 超预算时按 L3→L2→L1 优先级裁剪
+
+
+================================================================================
+六、LLM 适配层
+================================================================================
+
+6.1 三层 Provider 策略
+
+┌──────────┬──────────────────┬──────────────────────────┬──────────┐
+│ Provider │ 模型             │ 用途                     │ 定位     │
+├──────────┼──────────────────┼──────────────────────────┼──────────┤
+│ DeepSeek │ deepseek-chat    │ Writer/Architect/Supervisor│ 最优    │
+│ Kimi     │ moonshot-v1-8k   │ Inspector                │ 中等     │
+│ Qwen     │ qwen-turbo       │ Guardian/Custodian       │ 轻量     │
+└──────────┴──────────────────┴──────────────────────────┴──────────┘
+
+6.2 架构层次
+
+BaseLLMProvider (抽象接口)
+  ├── generate() / generate_stream()
+  ├── count_tokens()
+  └── supports_tools()
+       │
+       ▼
+DeepSeekProvider / KimiProvider / QwenProvider
+  (全部 OpenAI 兼容 HTTP API)
+       │
+       ▼
+NovelWriterChatModel (LangChain Adapter)
+  包装为 BaseChatModel，供 LangGraph 使用
+
+
+================================================================================
+七、数据模型全景 (15 个表)
+================================================================================
+
+User (单用户)
+  └── Novel (小说)
+        ├── Chapter → ChapterVersion (版本历史)
+        ├── Character (角色, 6层模型)
+        ├── Career (职业体系, 多阶段)
+        ├── WorldElement (世界元素, 树形结构)
+        ├── Organization → OrganizationMember
+        ├── CharacterRelationship (角色关系)
+        ├── Foreshadow (伏笔, planted→reminded→resolved)
+        ├── PlotArc → PlotEvent (情节弧线)
+        ├── OutlineNode (大纲节点, 含因果句)
+        ├── AnalysisReport (分析报告)
+        ├── ContextSnapshot (上下文快照)
+        ├── MemoryRule (记忆规则)
+        ├── Conversation (对话记录)
+        ├── GenerationLog (生成日志)
+        └── Skill (技能)
+
+
+================================================================================
+八、典型请求流程示意
+================================================================================
+
+以"生成第3章"为例:
+
+POST /api/v1/novels/{id}/chapters/3/generate
+        │
+        ▼
+  1. API 层 _build_initial_state()
+     ├── 查询 Novel、Chapter (不存在则创建)
+     ├── ContextAssembler.assemble() → 4层上下文
+     ├── 查询高重要性角色档案
+     └── 加载类型配置 (genre YAML)
+        │
+        ▼
+  2. LangGraph 流水线启动
+     ├── assemble_context → 验证并写入虚拟文件系统
+     ├── preflight
+     │   ├── Architect (DeepSeek): 检查情节因果、伏笔 → JSON 报告
+     │   └── Guardian (Qwen): 扫描大纲禁止术语 → 合规报告
+     ├── write_chapter
+     │   └── Writer (DeepSeek): 流式生成正文 → SSE 推送 token
+     ├── review_chapter
+     │   ├── Guardian (Qwen): 扫描正文违规词 (机械+LLM双重)
+     │   └── Inspector (Kimi): 10维质量打分 → JSON 报告
+     └── decide_verdict
+         ├── pass → 保存章节到DB, SSE返回done
+         ├── rewrite → 回到 write_chapter (局部修改)
+         └── regenerate → 回到 write_chapter (完全重写)
+        │
+        ▼
+  3. SSE 流式响应返回前端
+     phase: preflight → writing(token流) → review → done
+
+
+================================================================================
+九、第二步：搭建设定（详细）
+================================================================================
+
+设定阶段 = 手动表单 + AI 辅助。所有数据存入 SQLite 关系型数据库。
+
+9.1 手动创建（主要方式）
+
+以前端表单 → REST API → SQLite 表的标准 CRUD 流程：
+
+  POST /api/v1/novels/{id}/characters
+  {
+    "name": "林青云",
+    "role": "protagonist",
+    "layer1_worldview": "修仙界弱肉强食，唯有变强才能守护",
+    "layer2_identity": "没落剑阁的最后传人",
+    "layer3_values": "守护师门遗志，追求剑道极致",
+    "layer4_abilities": "筑基期修士，擅长快剑",
+    "layer5_skills": "御剑术、阵法基础",
+    "layer6_environment": "出身东荒小城，现居青云宗外门"
+  }
+  → characters.py → SQLite characters 表 INSERT
+
+9.2 AI 辅助生成
+
+  (1) 自动生成角色 POST /{novel_id}/characters/auto
+      扫描 outline_nodes 中的角色名 → DeepSeek 批量生成6层档案 → INSERT
+
+  (2) 自动生成职业体系 POST /{novel_id}/careers/generate
+      内置模板: 仙侠(炼气→筑基→金丹→元婴→化神)
+               西幻(学徒→法师→高阶→大法师→传奇)
+               都市(底层→白领→中层→精英→顶层)
+      不在模板 → DeepSeek 现场设计 → INSERT
+
+  (3) 自动生成组织
+      大纲中关键词匹配(宗/门/派/会/团/殿...) → DeepSeek 生成描述 → INSERT
+
+9.3 数据关联
+
+novels (小说)
+  ├── characters (角色)
+  │     ├── career_id → careers (职业体系)
+  │     └── current_stage → 职业第几阶段
+  ├── character_relationships (角色关系)
+  │     ├── source_char_id → characters
+  │     └── target_char_id → characters
+  ├── organizations (组织)
+  │     └── organization_members → characters
+  ├── world_elements (世界元素)
+  │     └── parent_id → world_elements (树形层级)
+  └── careers (职业体系)
+
+
+================================================================================
+十、Data Layer 详解
+================================================================================
+
+Data Layer 分为三层:
+
+10.1 关系型数据库 (SQLAlchemy + SQLite)
+
+存储所有结构化数据——人物设定、世界观设定、章节正文、伏笔、大纲。
+
+所有数据全部落在 SQLite 关系型表里。ChromaDB 只用于章节生成后的语义检索。
+
+10.2 向量数据库 (ChromaDB)
+
+app/services/vector_memory.py:
+
+  index_chapter(chapter_id, content, novel_id):
+      将章节前8000字嵌入后存入 ChromaDB
+
+  search_similar(query, novel_id, top_k=5):
+      语义搜索——找到与查询最相似的已写内容
+
+用途: 生成新章节时用当前上下文搜过往相关内容，保持前后一致。
+
+10.3 动态记忆学习
+
+app/services/memory.py:
+
+  AI 原稿 ──diff──→ 作者修改稿
+          │
+          ▼
+     LLM 分析差异，提取规则
+          │
+          ▼
+    存入 memory_rules 表
+    (如: "避免使用'突然间'作为转折" / "对话要更口语化")
+
+系统从作者的每次修改中学习写作偏好，逐步减少 AI 味。
+
+
+================================================================================
+十一、按任务复杂度分配合适模型（降本设计）
+================================================================================
+
+11.1 核心问题
+
+一次章节生成涉及 3-5 次 LLM 调用。如果全部用最贵的模型，
+审查类任务（违禁词扫描、一致性检查）浪费大量费用。
+
+11.2 按难度分档
+
+任务复杂度         Agent              模型              定位
+─────────────────────────────────────────────────────────────
+高 (创作)    Writer          DeepSeek deepseek-chat    最优，正文
+高 (创作)    Architect       DeepSeek deepseek-chat    最优，情节
+高 (创作)    Supervisor      DeepSeek deepseek-chat    最优，协调
+中 (审查)    Inspector       Kimi moonshot-v1-8k       中等，打分
+低 (检查)    Guardian        Qwen qwen-turbo           轻量，扫描
+低 (检查)    Custodian       Qwen qwen-turbo           轻量，比对
+
+决策逻辑:
+  - 写小说正文 → DeepSeek: 文笔质量决定读者体验，不能省
+  - 分析情节逻辑 → DeepSeek: 需要强推理能力
+  - 10 维质量打分 → Kimi: 需要判断力但不需极致文笔
+  - 扫描违禁词 → Qwen: 本质是模式匹配+简单语义
+  - 检查角色一致性 → Qwen: 拿档案对比文本，不需创作
+
+11.3 抽象层架构
+
+应用层 (generation_graph.py / agents.py)
+  → 只调用抽象接口，不关心底层是谁
+       │
+抽象层 (base.py)
+  BaseLLMProvider (ABC)
+  ├── generate() / generate_stream()
+  ├── count_tokens()
+  └── supports_tools()
+  统一数据结构: LLMMessage / LLMConfig / LLMResponse / LLMTool
+       │
+实现层
+  DeepSeekProvider / KimiProvider / QwenProvider
+  全部 OpenAI 兼容 HTTP API
+
+注册与获取 (registry.py):
+  _providers["deepseek"] = DeepSeekProvider  # 最优
+  _providers["kimi"] = KimiProvider          # 中等
+  _providers["qwen"] = QwenProvider          # 轻量
+
+  # 业务代码只需:
+  provider = get_provider("deepseek")
+  response = await provider.generate(messages, config)
+
+11.4 成本分析
+
+一次典型的章节生成调用分布:
+  Writer 写正文       DeepSeek  8000 tokens  (~$2.0/百万)
+  Architect 审情节    DeepSeek  2000 tokens
+  Guardian 查违禁     Qwen       500 tokens  (~$0.3/百万)
+  Inspector 评质量    Kimi      3000 tokens  (~$1.0/百万)
+  Custodian 查一致性  Qwen      1000 tokens
+  Guardian 审正文     Qwen       500 tokens
+  (可能重写)          DeepSeek  8000 tokens
+
+审查类调用占总调用次数的 ~50-60%，但每百万 token 成本仅为 DeepSeek 的 15-50%。
+
+综合节省效果: 在核心创作质量不受影响的前提下，总 token 成本降低 40%+。
+
+
+================================================================================
+十二、桥接 LangChain 生态（适配器详解）
+================================================================================
+
+12.1 问题
+
+LangGraph 和 LangChain Agent 期望 BaseChatModel 接口:
+  model.invoke([HumanMessage("...")]) → AIMessage
+
+我们自定义的是 BaseLLMProvider:
+  provider.generate([LLMMessage], LLMConfig) → LLMResponse
+
+两种接口完全不兼容——消息类型不同、返回类型不同、方法名不同。
+
+12.2 为什么用适配器
+
+  方案 A: 给每个 Provider 加 LangChain 接口 → 3个Provider都要改,代码重复
+  方案 B: 中间加一个适配器 → 写一次转换逻辑，三个 Provider 复用 ✓
+
+12.3 适配器做了什么
+
+NovelWriterChatModel (继承 BaseChatModel):
+
+  上层调用方 (LangGraph / LangChain Agent)
+        │
+        │  调用 .invoke() / .astream()
+        │  传入 [HumanMessage, AIMessage, ...]
+        │  期望返回 AIMessage / ChatGenerationChunk
+        │
+        ▼
+  ┌─────────────────────────────────────────┐
+  │         NovelWriterChatModel            │  ← 适配器
+  │         (继承 BaseChatModel)            │
+  │                                          │
+  │  invoke(messages):                       │
+  │    1. 翻译输入: HumanMessage → LLMMessage│
+  │    2. 调用真正Provider: provider.generate│
+  │    3. 翻译输出: LLMResponse → AIMessage  │
+  └─────────────────────────────────────────┘
+        │
+        │  调用 .generate() / .generate_stream()
+        │  传入 [LLMMessage, ...]
+        │  返回 LLMResponse / AsyncIterator[str]
+        │
+        ▼
+  ┌─────────────────────────────────────────┐
+  │    DeepSeekProvider / Kimi / Qwen       │  ← 什么都不用改
+  └─────────────────────────────────────────┘
+
+12.4 消息格式翻译
+
+  LangChain 输入                            自定义输出
+  ─────────────────────────────────────────────────────
+  [HumanMessage("你好")]          →  [LLMMessage(role="user", ...)]
+  [AIMessage("你好...")]          →  [LLMMessage(role="assistant", ...)]
+  [SystemMessage("你是助手")]     →  [LLMMessage(role="system", ...)]
+
+12.5 一条完整调用链
+
+generation_graph.py: write_chapter_node()
+  → writer.astream(state)  ← LangChain Agent
+    → model.astream([HumanMessage("请开始写作...")])
+      → NovelWriterChatModel._astream()  ← 适配器
+        → _langchain_to_custom(messages)
+        → provider.generate_stream(messages, config)
+          → DeepSeekProvider.generate_stream()
+            → HTTP POST https://api.deepseek.com/v1/chat/completions
+              → 流式返回 token
+        → 每个 token 包成 ChatGenerationChunk 返回
+  → SSE 推送给前端
+
+适配器不干任何业务逻辑——它只做格式翻译。
+
+
+================================================================================
+十三、多 Agent 协作框架（State + 虚拟文件系统 + 并发预检）
+================================================================================
+
+13.1 核心难题: Agent 之间怎么传数据
+
+5 个节点各自运行，每个都是独立函数，局部变量在返回后就没了。
+需要一种机制让上一个节点的产出传给下一个节点。
+
+13.2 State — 贯通的共享字典
+
+LangGraph 核心设计: 所有节点共享一个 State 字典，整个流水线中一直存在并逐节点更新。
+
+数据流动: 传入完整State → 函数读取需要的字段 → return dict = 增量更新
+                                                 → LangGraph 自动 merge
+
+State 随时间演变:
+  t=0  {novel_id, chapter_plan, genre_config, ...}
+       │  preflight_node
+  t=1  {..., architect_report ✅, guardian_pre_check ✅}
+       │  write_chapter_node
+  t=2  {..., chapter_content ✅}
+       │  review_chapter_node
+  t=3  {..., guardian_report ✅, inspector_report ✅}
+       │  decide_verdict
+  t=4  {..., verdict ✅}
+
+13.3 虚拟文件系统 — 超大内容的传递通道
+
+为什么需要: 有些数据不适合放 State 字段——比如完整 context_layers JSON 数十KB。
+虚拟文件系统是 files: dict[str, str]，文件名到内容的映射。
+
+三个工具:
+  ls_files(state) → 列出所有文件
+  read_file(path, offset, limit, state) → 分页读取文件
+  write_file(path, content, state) → 写入文件 (返回Command更新state)
+
+关键设计 — file_reducer 增量合并:
+  def file_reducer(left, right):
+      return {**left, **right}  # 合并!不是替换!
+
+  每个节点只返回自己产出的文件，LangGraph 自动合并:
+    assemble_context 写: {context_layers.json, chapter_plan.md}
+    preflight 写:       {architect_report.json, guardian_pre_check.json}
+    ─────────────────────────────────────────────────────────────
+    最终 state["files"] = 全部4个文件
+
+13.4 asyncio.gather 并发预检
+
+preflight 节点中 Architect 和 Guardian 互不依赖:
+  Architect: 分析情节因果、伏笔状态 → DeepSeek
+  Guardian:  扫描大纲中的禁止术语 → Qwen
+
+输入不同、逻辑不同、互相不读对方输出 → 可以并发:
+
+  arch_result, guard_result = await asyncio.gather(
+      run_architect(),    # → HTTP POST api.deepseek.com
+      run_guardian(),     # → HTTP POST dashscope.aliyuncs.com
+  )
+
+时间对比:
+  串行: Architect(3.0s) + Guardian(1.5s) = 4.5s
+  并发: max(3.0s, 1.5s) = 3.0s  →  节省 33%
+
+
+================================================================================
+十四、asyncio.gather 并发详解
+================================================================================
+
+14.1 并发的是什么
+
+两个 HTTP 请求同时发、同时等:
+
+  run_architect():
+    → HTTP POST https://api.deepseek.com/chat/completions
+
+  run_guardian():
+    → HTTP POST https://dashscope.aliyuncs.com/.../chat/completions
+
+两个请求打到不同服务器，互不等待对方响应。
+
+14.2 底层行为 (协程并发)
+
+时间轴 (单线程事件循环):
+  0.0s 两协程同时提交
+       ├─ 协程A: POST api.deepseek.com ──── 网络等待 ──── 收到响应
+       ├─ 协程B: POST dashscope.aliyuncs.com ─ 网络等待 ─ 收到响应(更早)
+       └─ 两协程同时在事件循环里，谁先到就先处理谁
+  1.5s Guardian 返回 → 解析完成
+  3.0s Architect 返回 → 解析完成 → asyncio.gather 集齐结果，继续
+
+能并发的根本原因: 两个 HTTP 调用之间没有数据依赖。
+
+14.3 为什么 review 阶段不能并发
+
+Inspector 的 prompt 包含 Guardian 的检查结果:
+  inspector_prompt = f"""
+  Guardian检查结果: {json.dumps(guardian_report)}
+  ...
+  """
+这是数据依赖——Inspector 需要知道 Guardian 发现了什么违规才能做判定。
+
+14.4 管线总耗时
+
+  preflight (并发):  max(3.0, 1.5) = 3.0s
+  write_chapter:     12.0s (最慢环节)
+  review (串行):     Guardian 1.5s + Inspector 2.5s = 4.0s
+  decide:            ~0s
+  ─────────────────────────
+  总耗时: ~19.0s
+
+
+================================================================================
+十五、Inspector + Guardian 质量把关（10维打分 + 双重扫描）
+================================================================================
+
+15.1 Inspector: 10 维严格打分
+
+定义在 agents.py:
+
+10个检查维度:
+  1. 类型合规    2. AI味检测    3. 情节逻辑    4. 角色一致性
+  5. 世界观合规  6. 伏笔钩子    7. 情感弧线    8. 节奏分布
+  9. 对话描写    10. 字数合规
+
+判定标准:
+  - fatal==0 && severe<=2 → pass
+  - fatal==0 && severe>2  → rewrite
+  - fatal>0                → regenerate
+
+输出 JSON:
+  {
+    "verdict": "pass|rewrite|regenerate",
+    "dimensions": [
+      {"name": "维度名", "score": 1-10, "severity": "fatal|severe|warning|ok",
+       "issues": ["问题"], "suggestions": ["建议"]}
+    ],
+    "overall_score": 1-10
+  }
+
+15.2 YAML 类型配置引擎
+
+app/genre/configs/ 下的 YAML 文件. 以科幻末世为例:
+
+  forbidden_terms:              # → Guardian 查什么
+    terms: [灵气, 丹田, 修炼, 功法, 魔法, 魔力, 仙人, 神仙]
+
+  taboos:                       # → Inspector 判什么违规
+    - "禁止修仙/魔法体系"
+    - "禁止设定前后矛盾"
+
+  prompt_segment:               # → Writer 怎么写的指令
+    "写具体匮乏——缺水、缺电、缺药，而不是笼统的'末世'"
+
+配置被三个地方消费:
+  → ContextAssembler: 拼入 L1 Bible
+  → Guardian Agent: 机械扫描 + LLM 检查违禁词
+  → Inspector Agent: 类型合规维度打分
+
+15.3 双重扫描机制
+
+第一层 — 机械扫描 (guard_tools.py):
+  纯 Python str.find() — 不调LLM, 零token, 零幻觉, 100%召回
+  盲区: 同义词替换 (如"灵气"→"天地元气")
+
+第二层 — LLM 语义检测:
+  Guardian Agent 的 system prompt:
+  "先机械扫描，通过后再用LLM做语义检查(同义替换)"
+  盲区: 无 (LLM可以理解语义变体)
+
+执行顺序:
+  Guardian 收到正文
+    → Step 1: scan_forbidden_terms_tool() — Python find(), 瞬间
+        ├─ 发现违规 → 直接报告
+        └─ 没发现 → Step 2: LLM语义检查
+                       "正文有'灵气'的同义替换吗?"
+                       → 发现"灵能波动"→ 标记
+
+互补效果:
+  机械扫描: 100%不漏, 0成本, 盲区=同义替换
+  LLM语义: 补同义变体, 可能有误判, 消耗~500 tokens
+  ──────────────────────────────────────────
+  组合 = 既不漏, 也不傻
+
+15.4 三者的协作关系
+
+YAML配置 → Guardian(机械→LLM双重) → Inspector(10维)
+               ↓                          ↓
+          violations列表          加权Guardian结果
+          passed=true/false       各维度打分
+                                  → verdict + overall_score
+
+================================================================================
+                              文件索引
+================================================================================
+
+backend/
+├── app/main.py                    应用入口,路由注册
+├── app/config.py                  配置(数据库/LLM/认证)
+├── app/database.py                数据库引擎与会话
+├── app/security.py                安全相关
+│
+├── app/middleware/
+│   └── auth_middleware.py         单用户模式
+│
+├── app/models/                    数据模型(15个表)
+│   ├── base.py                   基类 + TimestampMixin
+│   ├── novel.py                  小说
+│   ├── chapter.py                章节 + 版本历史
+│   ├── character.py              角色(6层模型)
+│   ├── career.py                 职业体系
+│   ├── world_element.py          世界元素
+│   ├── organization.py           组织/势力
+│   ├── relationship.py           角色关系
+│   ├── foreshadow.py             伏笔
+│   ├── plot.py                   情节弧线 + 大纲节点
+│   ├── memory_rule.py            记忆规则
+│   ├── context_snapshot.py       上下文快照
+│   ├── generation_log.py         生成日志
+│   ├── conversation.py           对话记录
+│   ├── analysis_report.py        分析报告
+│   ├── skill.py                  技能
+│   └── user.py                   用户
+│
+├── app/api/v1/                    API路由(14组)
+│   ├── novels.py                 小说CRUD
+│   ├── characters.py             角色CRUD
+│   ├── world.py                  世界元素CRUD
+│   ├── organizations.py          组织CRUD
+│   ├── relationships.py          关系CRUD
+│   ├── careers.py                职业CRUD + AI生成
+│   ├── generation.py             章节生成(SSE + LangGraph)
+│   ├── analysis.py               章节分析
+│   ├── foreshadows.py            伏笔管理
+│   ├── revision.py               章节修订
+│   ├── export.py                 导出
+│   └── import_book.py            导入
+│
+├── app/services/                  服务层
+│   ├── context_assembly.py       4层上下文组装
+│   ├── plot_analyzer.py          10维分析(已迁移至LangGraph)
+│   ├── chapter_regenerator.py    章节重写
+│   ├── foreshadow_service.py     伏笔检测与生命周期
+│   ├── auto_character.py         自动角色生成
+│   ├── auto_organization.py      自动组织生成
+│   ├── career_service.py         职业体系自动生成
+│   ├── character_state.py        角色状态追踪
+│   ├── memory.py                 动态记忆学习(diff分析)
+│   ├── vector_memory.py          ChromaDB向量检索
+│   ├── export_service.py         多格式导出
+│   └── book_import.py            书籍导入拆解
+│
+├── app/langgraph/                 LangGraph流水线
+│   ├── state.py                  ChapterState定义
+│   ├── generation_graph.py       章节生成DAG(5节点)
+│   ├── agents.py                 6个Agent定义+工厂
+│   ├── tools.py                  工具集(LangChain @tool)
+│   └── guard_tools.py            机械术语扫描
+│
+├── app/llm/                       LLM适配层
+│   ├── base.py                   抽象接口(ABC)
+│   ├── deepseek.py               DeepSeek Provider
+│   ├── kimi.py                   Kimi Provider
+│   ├── qwen.py                   Qwen Provider
+│   ├── registry.py               Provider注册中心(单例)
+│   └── langchain_adapter.py      LangChain桥接适配器
+│
+└── app/genre/                     类型配置引擎
+    ├── loader.py                  YAML加载与缓存
+    └── configs/                   类型配置文件
+        ├── xianxia.yaml
+        ├── western-fantasy.yaml
+        ├── urban.yaml
+        └── scifi-apocalypse.yaml
+
+================================================================================

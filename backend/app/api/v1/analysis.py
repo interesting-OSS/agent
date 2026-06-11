@@ -1,8 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
-from app.middleware.auth_middleware import get_current_user_id
 from app.models.novel import Novel
 from app.models.chapter import Chapter
 from app.models.character import Character
@@ -12,15 +11,17 @@ import json
 
 router = APIRouter()
 
-@router.get("/{novel_id}/analysis/{chapter_id}")
-async def get_analysis(novel_id: str, chapter_id: str, request: Request, db: AsyncSession = Depends(get_db)):
-    uid = await get_current_user_id(request)
-    r = await db.execute(select(Novel).where(Novel.id == novel_id, Novel.user_id == uid))
+async def _verify_novel_exists(novel_id: str, db: AsyncSession):
+    r = await db.execute(select(Novel).where(Novel.id == novel_id))
     if not r.scalar(): raise HTTPException(404)
+
+@router.get("/{novel_id}/analysis/{chapter_id}")
+async def get_analysis(novel_id: str, chapter_id: str, db: AsyncSession = Depends(get_db)):
+    await _verify_novel_exists(novel_id, db)
     ch = (await db.execute(select(Chapter).where(Chapter.id == chapter_id))).scalar()
     if not ch or not ch.content: raise HTTPException(404, "No content to analyze")
 
-    novel = r.scalar()
+    novel = (await db.execute(select(Novel).where(Novel.id == novel_id))).scalar()
     genre_cfg = {}
     if novel.genre_id:
         try: genre_cfg = load_genre_config(novel.genre_id)

@@ -1,0 +1,13 @@
+墨庐 (MoLu) — AI 多智能体小说写作系统
+技术栈：Python、FastAPI、LangGraph、LangChain、DeepSeek/Kimi/Qwen、ChromaDB、Next.js、React、Ant Design、Zustand
+项目介绍：基于 LangGraph + LangChain 构建的多智能体协作小说写作平台。将小说创作这一复杂认知任务分解为 6 个专职 AI Agent，通过 LangGraph 编排成确定性流水线，实现从上下文组装、情节预检、正文写作到质量审查、自动修订的完整闭环。用户只需设定世界观与角色，Agent 即可逐章自动创作，并在每章完成后由独立审查 Agent 进行 10 维质量打分，不达标自动重写。
+主要实现：
+基于 LangGraph StateGraph 构建 6 智能体协作流水线（Supervisor/Architect/Writer/Inspector/Guardian/Custodian），实现 assemble_context → preflight（Architect ∥ Guardian 并行）→ write_chapter（SSE 流式）→ review → verdict 自动分支循环；自定义 ChapterState 继承 AgentState，扩展 15+ 字段及虚拟文件系统，Agent 间通过 files dict 传递结构化上下文，避免自然语言二次解析
+异构多模型协作：按任务复杂度分配合适模型 —— 主力写作用 DeepSeek、审校用 Kimi、轻量检查用 Qwen，在保证质量的同时控制 API 成本；自建 LLM Provider 抽象层（BaseLLMProvider → DeepSeek/Kimi/Qwen），统一 generate/stream 接口，并通过自定义 NovelWriterChatModel 适配器桥接 LangChain ChatModel，使自建 provider 无缝接入 LangGraph/LangChain 生态
+实现 PreFlight 并行检查机制：Architect（情节逻辑/因果链/伏笔/时间线）与 Guardian（类型合规/禁止术语扫描）使用 asyncio.gather 并发执行，总耗时 = max(Architect, Guardian) 而非两者之和
+构建 4 层上下文组装系统（ContextAssembler）：Layer1 类型约束 + 禁止术语 → Layer2 前 3 章关键事件 + 角色状态 → Layer3 历史摘要（长期记忆）→ Layer4 大纲规划 + 伏笔提醒，每章生成前自动注入 Writer Agent
+实现质量闭环：Inspector Agent 10 维评分（类型合规/AI味检测/情节逻辑/角色一致性/世界观/伏笔钩子/情感弧线/节奏/对话/字数），根据 fatal/severe 计数自动判定 pass/rewrite/regenerate，循环直至达标
+设计类型配置引擎：每种小说题材（仙侠/科幻末世/都市/西方奇幻）定义独立 YAML 配置（文风蓝图/禁止术语/爽点节奏/写作禁忌），Guardian Agent 加载对应配置实现类型合规自动化校验；双重机制（机械术语扫描 100% 召回 + LLM 语义检测同义替换规避）防止跨类型术语污染
+实现记忆学习系统：对比 AI 原稿与作者修改稿 diff，通过 LLM 提取修改模式生成 MemoryRule，后续生成时自动注入高优先级规则到 prompt，实现"越写越像作者本人"的渐进优化
+基于 ChromaDB + sentence-transformers 实现向量记忆，支持章节内容语义检索，为上下文组装提供长期记忆支撑
+使用 LangGraph astream_events 实现 token 级 SSE 流式输出，前端实时逐字渲染章节生成过程，配合 TipTap 富文本编辑器提供沉浸式写作体验
